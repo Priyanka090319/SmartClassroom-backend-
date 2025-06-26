@@ -1,86 +1,3 @@
-"""from fastapi import FastAPI, UploadFile, Form
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import face_recognition
-import numpy as np
-import io
-import os
-from datetime import datetime
-
-# Import attendance logger functions
-from attendance_logger import initialize_csv, log_attendance
-
-app = FastAPI()
-
-# Enable CORS (for React frontend or testing)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Change to ["http://localhost:3000"] in production
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-@app.get("/")
-def root():
-    return {"message": "Smart Classroom Backend is running"}
-
-# Constants
-FACES_DIR = "faces"
-LOG_FILE = "attendance_log.csv"
-# Ensure the faces directory and CSV are ready
-os.makedirs(FACES_DIR, exist_ok=True)
-initialize_csv()
-
-@app.post("/register/")
-async def register(name: str = Form(...), file: UploadFile = Form(...)):
-    print(f"Register called for name: {name}")
-    contents = await file.read()
-    print(f"File size received: {len(contents)} bytes")
-    img = face_recognition.load_image_file(io.BytesIO(contents))
-    encodings = face_recognition.face_encodings(img)
-
-    if len(encodings) == 0:
-        print("No face detected on register")
-        return JSONResponse(content={"status": "error", "message": "No face detected."}, status_code=400)
-
-    encoding = encodings[0]
-    safe_name = name.strip().replace(" ", "_")
-    file_path = os.path.join(FACES_DIR, f"{safe_name}.npy")
-    np.save(file_path, encoding)
-    print(f"Saved face encoding at {file_path}")
-
-    return {"status": "success", "message": f"Student {name} successfully registered."}
-
-@app.post("/attendance/")
-async def attendance(file: UploadFile = Form(...)):
-    print("Attendance called")
-    contents = await file.read()
-    print(f"File size received: {len(contents)} bytes")
-    img = face_recognition.load_image_file(io.BytesIO(contents))
-    encodings = face_recognition.face_encodings(img)
-
-    if len(encodings) == 0:
-        print("No face detected on attendance")
-        return JSONResponse(content={"status": "error", "message": "No face detected."}, status_code=400)
-
-    captured_encoding = encodings[0]
-
-    for filename in os.listdir(FACES_DIR):
-        known_encoding = np.load(os.path.join(FACES_DIR, filename))
-        match = face_recognition.compare_faces([known_encoding], captured_encoding)[0]
-        if match:
-            raw_name = os.path.splitext(filename)[0]
-            name = raw_name.replace("_", " ")
-            print(f"Face matched: {name}")
-            log_attendance(name, "Present")
-            return {"status": "success", "message": f"Hello {name}, your attendance is marked."}
-
-    print("Face not recognized")
-    return JSONResponse(content={"status": "fail", "message": "Face not recognized. Please register first."}, status_code=404)   """
-
-
-
-# File: main.py
 
 from fastapi import FastAPI, UploadFile, Form
 from fastapi.responses import JSONResponse
@@ -90,8 +7,7 @@ import numpy as np
 import io
 import os
 import cv2
-from datetime import datetime
-from attendance_logger import initialize_csv, log_attendance
+from attendance_logger import initialize_csv, log_attendance, already_marked_today
 
 app = FastAPI()
 
@@ -118,11 +34,20 @@ os.makedirs(FACES_DIR, exist_ok=True)
 initialize_csv()
 
 def save_debug_image(img_array, face_locations, file_name):
-    """Draw rectangles around detected faces and save image."""
     img = img_array.copy()
     for (top, right, bottom, left) in face_locations:
         cv2.rectangle(img, (left, top), (right, bottom), (0, 255, 0), 2)
     cv2.imwrite(file_name, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+def is_face_already_registered(new_encoding):
+    for filename in os.listdir(FACES_DIR):
+        if filename.endswith(".npy"):
+            known_encoding = np.load(os.path.join(FACES_DIR, filename))
+            distance = face_recognition.face_distance([known_encoding], new_encoding)[0]
+            if distance < TOLERANCE:
+                existing_name = os.path.splitext(filename)[0].replace("_", " ")
+                return True, existing_name
+    return False, None
 
 @app.post("/register/")
 async def register(name: str = Form(...), file: UploadFile = Form(...)):
@@ -136,14 +61,25 @@ async def register(name: str = Form(...), file: UploadFile = Form(...)):
     if len(encodings) == 0:
         return JSONResponse(content={"status": "error", "message": "No face detected."}, status_code=400)
     elif len(encodings) > 1:
-        return JSONResponse(content={"status": "error", "message": "Multiple faces detected. Please use a single face image."}, status_code=400)
+        return JSONResponse(content={"status": "error", "message": "Multiple faces detected. Use a single face image."}, status_code=400)
 
     encoding = encodings[0]
+
+    already_registered, existing_name = is_face_already_registered(encoding)
+    if already_registered:
+        return JSONResponse(
+            content={
+                "status": "error",
+                "message": f"This face is already registered as {existing_name}. Cannot register with another name."
+            },
+            status_code=403
+        )
+
     safe_name = name.strip().replace(" ", "_")
     file_path = os.path.join(FACES_DIR, f"{safe_name}.npy")
     np.save(file_path, encoding)
 
-    return {"status": "success", "message": f"Student {name} successfully registered."}
+    return {"status": "success", "message": f"Hello {name}, you are successfully registered."}
 
 @app.post("/attendance/")
 async def attendance(file: UploadFile = Form(...)):
@@ -170,16 +106,24 @@ async def attendance(file: UploadFile = Form(...)):
             raw_name = os.path.splitext(filename)[0]
             names.append(raw_name.replace("_", " "))
 
-        if not known_faces:
-           return JSONResponse(content={"message": "No registered faces found."}, status_code=404)
+    if not known_faces:
+        return JSONResponse(content={"status": "error", "message": "No registered faces found."}, status_code=404)
 
-    # Compute distances and find best match
     distances = face_recognition.face_distance(known_faces, captured_encoding)
     best_match_index = np.argmin(distances)
 
     if distances[best_match_index] < TOLERANCE:
         name = names[best_match_index]
+
+        if already_marked_today(name):
+            return JSONResponse(
+                content={"status": "info", "message": f"{name}, you have already marked your attendance today."},
+                status_code=200
+            )
+
         log_attendance(name, "Present")
         return {"status": "success", "message": f"Hello {name}, your attendance is marked."}
     else:
         return JSONResponse(content={"status": "fail", "message": "Face not recognized. Please register first."}, status_code=404)
+
+
